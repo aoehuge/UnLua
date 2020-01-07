@@ -86,8 +86,7 @@ bool UUnLuaManager::Bind(UObjectBaseUtility *Object, UClass *Class, const TCHAR 
     {
         if (Object->GetClass() != Class)
         {
-            TArray<UClass*> &DerivedClasses = Base2DerivedClasses.FindOrAdd(Class);
-            DerivedClasses.AddUnique(Object->GetClass());
+            OnDerivedClassBinded(Object->GetClass(), Class);
         }
 
         GLuaCxt->AddModuleName(InModuleName);                                       // record this required module
@@ -166,22 +165,39 @@ bool UUnLuaManager::OnModuleHotfixed(const TCHAR *InModuleName)
 /**
  * Remove binded UObjects
  */
-void UUnLuaManager::RemoveAttachedObject(UObjectBaseUtility *Object)
+void UUnLuaManager::NotifyUObjectDeleted(const UObjectBase *Object, bool bUClass)
 {
-    lua_State *L = *GLuaCxt;
-    if (!L)
-    {
-        return;
-    }
-
-    int32 ObjectRef = LUA_REFNIL;
-    bool bSuccess = AttachedObjects.RemoveAndCopyValue(Object, ObjectRef);
-    if (bSuccess && ObjectRef != LUA_REFNIL)
-    {
-        luaL_unref(L, LUA_REGISTRYINDEX, ObjectRef);        // remove Lua reference of Lua instance (table)
-    }
     GObjectReferencer.RemoveObjectRef((UObject*)Object);
-    DeleteLuaObject(L, Object);                             // delete the Lua instance (table)
+
+    if (bUClass)
+    {
+        UClass *BaseClass = nullptr;
+        UClass *DerivedClass = (UClass*)Object;
+        if (Derived2BaseClasses.RemoveAndCopyValue(DerivedClass, BaseClass))
+        {
+            TArray<UClass*> *DerivedClasses = Base2DerivedClasses.Find(BaseClass);
+            if (DerivedClasses)
+            {
+                DerivedClasses->Remove(DerivedClass);
+            }
+        }
+    }
+    else
+    {
+        lua_State *L = *GLuaCxt;
+        if (!L)
+        {
+            return;
+        }
+
+        int32 ObjectRef = LUA_REFNIL;
+        bool bSuccess = AttachedObjects.RemoveAndCopyValue((UObjectBaseUtility*)Object, ObjectRef);
+        if (bSuccess && ObjectRef != LUA_REFNIL)
+        {
+            luaL_unref(L, LUA_REGISTRYINDEX, ObjectRef);        // remove Lua reference of Lua instance (table)
+        }
+        DeleteLuaObject(L, (UObjectBaseUtility*)Object);        // delete the Lua instance (table)
+    }
 }
 
 /**
@@ -257,6 +273,7 @@ void UUnLuaManager::CleanupDuplicatedFunctions()
     }
     DuplicatedFunctions.Empty();
     Base2DerivedClasses.Empty();
+    Derived2BaseClasses.Empty();
 }
 
 /**
@@ -313,22 +330,21 @@ void UUnLuaManager::PostCleanup()
         for (UObjectBaseUtility *ObjectBU : Objects)
         {
             UObject *Object = (UObject*)ObjectBU;
-            UClass *Class = Object->GetClass();
-            if (!Class->ImplementsInterface(InterfaceClass))
+            UFunction *Func = nullptr;
+            UClass *Class = GetTargetClass(Object->GetClass(), &Func);
+            if (!Class)
             {
                 continue;
             }
-            if (!RegisterClass(*GLuaCxt, Class))
+            if (!RegisterClass(*GLuaCxt, Object->GetClass()))
             {
                 continue;
             }
 
             // bind survival UObjects again...
-            UFunction *Func = Class->FindFunctionByName(FName("GetModuleName"));
-            check(Func && Func->GetNativeFunc());
+            check(Func);
             FString ModuleName;
             Object->UObject::ProcessEvent(Func, &ModuleName);    // force to invoke UObject::ProcessEvent(...)
-            Class = Func->GetOuterUClass();
             if (ModuleName.Len() < 1)
             {
                 ModuleName = Class->GetName();
@@ -410,7 +426,7 @@ void UUnLuaManager::OnMapLoaded(UWorld *World)
 #if SUPPORTS_RPC_CALL
     for (AActor *Actor : ActorsWithoutWorld)
     {
-        UClass *Class = Actor->GetClass();
+        UClass *Class = GetTargetClass(Actor->GetClass());
         FString *ModuleName = ModuleNames.Find(Class);
         check(ModuleName);
         TSet<FName> *LuaFunctionsPtr = ModuleFunctions.Find(*ModuleName);
@@ -476,7 +492,7 @@ void UUnLuaManager::OnActorDestroyed(AActor *Actor)
     int32 Num = AttachedActors.Remove(Actor);
     if (Num > 0)
     {
-        RemoveAttachedObject(Actor);            // remove record of this actor
+        NotifyUObjectDeleted(Actor);            // remove record of this actor
     }
 }
 
@@ -486,6 +502,48 @@ void UUnLuaManager::OnActorDestroyed(AActor *Actor)
 void UUnLuaManager::OnLatentActionCompleted(int32 LinkID)
 {
     GLuaCxt->ResumeThread(LinkID);              // resume a coroutine
+}
+
+/**
+ * Notify that a derived class is binded to its base class
+ */
+void UUnLuaManager::OnDerivedClassBinded(UClass *DerivedClass, UClass *BaseClass)
+{
+    TArray<UClass*> &DerivedClasses = Base2DerivedClasses.FindOrAdd(BaseClass);
+    do
+    {
+        if (DerivedClasses.Find(DerivedClass) != INDEX_NONE)
+        {
+            break;
+        }
+        Derived2BaseClasses.Add(DerivedClass, BaseClass);
+        DerivedClasses.Add(DerivedClass);
+        DerivedClass = DerivedClass->GetSuperClass();
+    } while (DerivedClass != BaseClass);
+}
+
+/**
+ * Get target UCLASS for Lua binding
+ */
+UClass* UUnLuaManager::GetTargetClass(UClass *Class, UFunction **GetModuleNameFunc)
+{
+    static UClass *InterfaceClass = UUnLuaInterface::StaticClass();
+    if (!Class || !Class->ImplementsInterface(InterfaceClass))
+    {
+        return nullptr;
+    }
+    UFunction *Func = Class->FindFunctionByName(FName("GetModuleName"));
+    if (Func && Func->GetNativeFunc())
+    {
+        if (GetModuleNameFunc)
+        {
+            *GetModuleNameFunc = Func;
+        }
+
+        UClass *OuterClass = Func->GetOuterUClass();
+        return OuterClass == InterfaceClass ? Class : OuterClass;
+    }
+    return nullptr;
 }
 
 /**
@@ -562,6 +620,12 @@ bool UUnLuaManager::BindSurvivalObject(lua_State *L, UObjectBaseUtility *Object,
     lua_pop(L, 2);
     int32 ObjectRef = luaL_ref(L, LUA_REGISTRYINDEX);
     AddAttachedObject(Object, ObjectRef);
+
+    if (Object->GetClass() != Class)
+    {
+        OnDerivedClassBinded(Object->GetClass(), Class);
+    }
+
     return true;
 }
 
